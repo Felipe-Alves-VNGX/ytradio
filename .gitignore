@@ -8,3 +8,7 @@ state.json
 config.json
 cookies.txt
 headers.txt
+
+# libmpv do Windows (baixado à parte)
+mpv-2.dll
+libmpv-2.dll

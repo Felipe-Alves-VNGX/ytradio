@@ -48,6 +48,13 @@ except OSError as _e:
              f"do ytradio ou em {os.path.join(config_dir(), 'mpv')} (ou defina YTRADIO_MPV_DIR). Detalhe: {_e}")
 import requests  # noqa: E402
 import yt_dlp  # noqa: E402
+if IS_WIN:  # o dbus_fast calcula CMSG_LEN ao importar; o socket do Windows não tem (o D-Bus só é usado no Linux)
+    import socket as _socket
+
+    if not hasattr(_socket, "CMSG_LEN"):
+        _socket.CMSG_LEN = lambda n: n
+    if not hasattr(_socket, "SCM_RIGHTS"):
+        _socket.SCM_RIGHTS = 1
 from dbus_fast import BusType, Variant  # noqa: E402
 from dbus_fast.aio import MessageBus  # noqa: E402
 from dbus_fast.service import PropertyAccess, ServiceInterface, dbus_property, method  # noqa: E402
@@ -166,6 +173,49 @@ def cookie_help(detail: str) -> str:
         msg += ("Entre no music.youtube.com neste navegador, ou aponte o perfil com YTRADIO_PROFILE, ou use um cookies.txt "
                 "com YTRADIO_COOKIES.")
     return msg + f"\n\nConfig: {CONFIG_FILE}"
+
+
+LOGIN_URL = "https://music.youtube.com/"
+BROWSER_EXES = {  # nome -> (comandos no PATH, caminhos relativos nas pastas de programas do Windows)
+    "firefox": (["firefox"], [r"Mozilla Firefox\firefox.exe"]),
+    "zen": (["zen", "zen-browser"], [r"Zen Browser\zen.exe"]),
+    "librewolf": (["librewolf"], [r"LibreWolf\librewolf.exe"]),
+    "waterfox": (["waterfox"], [r"Waterfox\waterfox.exe"]),
+    "chrome": (["google-chrome", "chrome"], [r"Google\Chrome\Application\chrome.exe"]),
+    "chromium": (["chromium", "chromium-browser"], []),
+    "edge": (["microsoft-edge", "msedge"], [r"Microsoft\Edge\Application\msedge.exe"]),
+    "brave": (["brave", "brave-browser"], [r"BraveSoftware\Brave-Browser\Application\brave.exe"]),
+}
+
+
+def open_login_browser() -> str:
+    """Abre o music.youtube.com no navegador configurado (o do login) para o usuário entrar de novo.
+    Devolve o nome do navegador aberto (ou "padrão" se caiu no navegador padrão do sistema)."""
+    import subprocess
+    import webbrowser
+
+    cmds, rels = BROWSER_EXES.get(BROWSER, ([BROWSER], []))
+    exe = next((w for w in map(shutil.which, cmds) if w), None)
+    if not exe and IS_WIN:
+        roots = [os.environ.get(k) for k in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA")]
+        roots += [os.path.join(os.environ["LOCALAPPDATA"], "Programs")] if os.environ.get("LOCALAPPDATA") else []
+        exe = next((p for r in roots if r for rel in rels if os.path.isfile(p := os.path.join(r, rel))), None)
+    if exe:
+        try:
+            subprocess.Popen([exe, LOGIN_URL], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True)
+            return BROWSER
+        except OSError:
+            pass
+    webbrowser.open(LOGIN_URL)
+    return "padrão"
+
+
+AUTH_ERROR_HINTS = ("401", "403", "unauthorized", "forbidden", "logged out", "sign in", "authentication", "login")
+
+
+def looks_like_auth_error(e: Exception) -> bool:
+    return any(h in str(e).lower() for h in AUTH_ERROR_HINTS)
 
 
 def load_cookie_jar():
@@ -302,7 +352,22 @@ class Api:
                 return getattr(self.yt, name)(*a, **k)
             except Exception:
                 self.connect()  # cookies podem ter rotacionado: relê do Zen e tenta de novo
-                return getattr(self.yt, name)(*a, **k)
+                try:
+                    return getattr(self.yt, name)(*a, **k)
+                except Exception as e:
+                    if looks_like_auth_error(e):
+                        raise CookieError(cookie_help("a sessão do YouTube expirou")) from e
+                    raise
+
+    def logged_in(self) -> bool:
+        """Relê os cookies do navegador e confirma que o YouTube Music aceita o login."""
+        try:
+            with self.lock:
+                self.connect()
+                self.yt.get_account_info()
+            return True
+        except Exception:
+            return False
 
     def tracks(self, raw) -> list[dict]:
         return [t for t in (norm(x) for x in raw or []) if t]
@@ -1147,6 +1212,18 @@ class InfoScreen(ModalScreen):
             yield Static("Enter ou Esc para fechar", id="ihint")
 
 
+class LoginScreen(InfoScreen):
+    """Sessão do YouTube ausente/expirada: o navegador já foi aberto e o app espera o login."""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ibox"):
+            yield Static(self.title_text, id="ititle")
+            yield Static(self.body, markup=False)
+            yield Static("Aguardando o login… (o ytradio continua sozinho)  ·  Enter: abrir o navegador de novo  ·  Esc: fechar", id="ihint")
+
+    BINDINGS = [("escape", "dismiss(None)", "Fechar"), ("enter", "dismiss('reopen')", "Reabrir")]
+
+
 class ThemePicker(ModalScreen):
     """Seletor de tema: álbum, paleta do terminal (ANSI) ou presets."""
 
@@ -1384,12 +1461,30 @@ class YTRadio(App):
 
     # ---- helpers de UI
     def report_error(self, e: Exception, prefix: str):
-        if isinstance(e, CookieError):  # texto longo: janela explicativa (uma vez só)
+        if isinstance(e, CookieError):  # abre o navegador para relogar e espera o login (uma vez só)
             if not getattr(self, "_cookie_info_shown", False):
                 self._cookie_info_shown = True
-                self.push_screen(InfoScreen("Login do YouTube necessário", str(e)))
+                opened = open_login_browser()
+                self.push_screen(LoginScreen("Login do YouTube necessário", f"{e}\n\nAbri o music.youtube.com ({opened}). "
+                                             "Entre na sua conta lá; assim que o login for detectado o ytradio recarrega sozinho."),
+                                 lambda r: open_login_browser() if r == "reopen" else None)
+                self.run_worker(self.wait_for_login(), exclusive=False)
             return
         self.flash(f"{prefix}: {str(e)[:120]}")
+
+    async def wait_for_login(self, timeout: float = 600, every: float = 5):
+        """Espera (até 10 min) o login aparecer nos cookies do navegador; então recarrega a biblioteca."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(every)
+            if await self.io(self.api.logged_in):
+                if isinstance(self.screen, LoginScreen):
+                    self.pop_screen()
+                self.flash("Login detectado!")
+                self._cookie_info_shown = False
+                self.run_worker(self.load_sidebar(), exclusive=False)
+                return
+        self._cookie_info_shown = False  # desistiu: o próximo erro de login reabre o fluxo
 
     def flash(self, msg: str):
         self.message = msg

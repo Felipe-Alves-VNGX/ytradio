@@ -1,4 +1,4 @@
-# Instala o ytradio no Windows: cria um venv local e instala as dependências.
+﻿# Instala o ytradio no Windows: cria um venv local e instala as dependências.
 # Rode no PowerShell, dentro da pasta do projeto:  powershell -ExecutionPolicy Bypass -File .\install.ps1
 $ErrorActionPreference = "Stop"
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
