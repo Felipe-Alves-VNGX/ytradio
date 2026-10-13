@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+# nunca versionar login/estado local
+state.json
+config.json
+cookies.txt
+headers.txt

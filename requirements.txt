@@ -1,0 +1,17 @@
+# Python 3.12+
+textual>=8.2
+textual-image>=0.14
+ytmusicapi>=1.12
+yt-dlp
+python-mpv>=1.0.8
+requests
+pillow>=10.3
+dbus-fast>=2.0
+
+# Controles de mídia do Windows (SMTC) — opcional e experimental
+winrt-runtime; sys_platform == "win32"
+winrt-Windows.Foundation; sys_platform == "win32"
+winrt-Windows.Foundation.Collections; sys_platform == "win32"
+winrt-Windows.Media; sys_platform == "win32"
+winrt-Windows.Media.Playback; sys_platform == "win32"
+winrt-Windows.Storage.Streams; sys_platform == "win32"
