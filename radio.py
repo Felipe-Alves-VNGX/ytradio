@@ -20,8 +20,10 @@ class RadioQueue:
         self.qi = -1
         self.ids: set[str] = set()
         self.generation = 0
+        self.revision = 0  # sobe a cada alteração da fila feita pelo abastecimento (adição ou corte)
         self.max_history = max_history
         self._task: asyncio.Task | None = None
+        self._trimmed = False
 
     def reset(self, tracks: list[Track], qi: int = -1) -> None:
         self.generation += 1
@@ -57,12 +59,15 @@ class RadioQueue:
                 added.append(t)
         self.tracks.extend(added)
         self._trim()
+        if added or self._trimmed:
+            self.revision += 1
         return len(added)
 
     def _trim(self) -> None:
         drop = self.qi - self.max_history
-        if drop <= 0:
+        self._trimmed = drop > 0
+        if not self._trimmed:
             return
-        self.ids.difference_update(t["id"] for t in self.tracks[:drop])
         del self.tracks[:drop]
         self.qi -= drop
+        self.ids = {t["id"] for t in self.tracks}  # uma playlist pode repetir o ID em outra posição

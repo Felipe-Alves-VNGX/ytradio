@@ -1690,15 +1690,15 @@ class YTRadio(App):
             self.run_worker(self._extend_radio(), exclusive=False, group="radio", exit_on_error=False)
 
     async def _extend_radio(self) -> bool:
-        gen = self.rq.generation
+        gen, rev = self.rq.generation, self.rq.revision
         try:
-            added = await self.rq.refill(lambda seed: self.io(self.api.radio, seed))
+            await self.rq.refill(lambda seed: self.io(self.api.radio, seed))
         except Exception as e:
             log.exception("falha ao abastecer o rádio")
             if gen == self.rq.generation:
                 self.flash(f"Rádio: {e}")
             return False
-        if added:
+        if gen == self.rq.generation and rev != self.rq.revision:  # adicionou ou cortou faixas
             if self.view == "queue":
                 self.fill(list(self.queue), "Fila / rádio", "queue")
             self.prefetch_next()

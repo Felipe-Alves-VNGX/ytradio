@@ -137,6 +137,32 @@ class RadioQueueTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(q.tracks[q.qi]["id"], f"t{n - 1}")
         self.assertEqual(q.ids, {t["id"] for t in q.tracks})
 
+    async def test_trim_keeps_ids_still_in_queue(self):
+        q = RadioQueue(max_history=1)
+        q.reset([track("A"), track("B"), track("A")], 2)
+        await q.refill(self.fetcher([track("C")]))
+        self.assertEqual([t["id"] for t in q.tracks], ["tB", "tA", "tC"])
+        self.assertEqual(q.ids, {"tB", "tA", "tC"})
+        await q.refill(self.fetcher([track("A")]))
+        self.assertEqual([t["id"] for t in q.tracks], ["tB", "tA", "tC"])
+
+    async def test_revision_changes_when_only_trimming(self):
+        q = RadioQueue(max_history=1)
+        q.reset([track(0), track(1), track(2), track(3)], 3)
+        rev = q.revision
+        await q.refill(self.fetcher([track(3)]))  # nada novo, mas o histórico é cortado
+        self.assertEqual([t["id"] for t in q.tracks], ["t2", "t3"])
+        self.assertNotEqual(q.revision, rev)
+        rev = q.revision
+        await q.refill(self.fetcher([track(3)]))  # nada novo e nada cortado
+        self.assertEqual(q.revision, rev)
+
+    @staticmethod
+    def fetcher(batch):
+        async def fetch(seed):
+            return batch
+        return fetch
+
 
 if __name__ == "__main__":
     unittest.main()
