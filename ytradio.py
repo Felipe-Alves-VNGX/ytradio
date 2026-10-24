@@ -11,6 +11,7 @@ import glob
 import io
 import json
 import locale
+import logging
 import os
 import random
 import re
@@ -81,9 +82,11 @@ except Exception:  # biblioteca ausente: só blocos de texto
     GfxImage, GRAPHICS = None, False
 from yt_dlp.cookies import extract_cookies_from_browser  # noqa: E402
 from ytmusicapi import YTMusic  # noqa: E402
+from radio import RadioQueue  # noqa: E402
 
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0"
 STATE_FILE = os.path.join(config_dir(), "state.json")
+log = logging.getLogger("ytradio")
 CONFIG_FILE = os.path.join(config_dir(), "config.json")
 
 
@@ -314,12 +317,23 @@ def load_state() -> dict:
 
 
 def save_state(d: dict) -> None:
+    """Grava em arquivo temporário na mesma pasta e troca de uma vez, para não corromper o estado."""
+    tmp = None
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, "w") as f:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE_FILE), prefix="state.", suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
             json.dump(d, f)
+        os.replace(tmp, STATE_FILE)
+        tmp = None
     except Exception:
-        pass
+        log.exception("não foi possível salvar %s", STATE_FILE)
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 # ----------------------------------------------------------------------------- YouTube Music API
@@ -1303,15 +1317,12 @@ class YTRadio(App):
         self.volume: float = st.get("volume", 80)
         self.loop: bool = st.get("loop", False)
         self.autoplay: bool = st.get("autoplay", True)
-        self.queue: list[dict] = []
-        self.qi = -1
+        self.rq = RadioQueue()
         self.current: dict | None = None
         self.rows: list[dict] = []
         self.view = "search"
         self.view_title = ""
-        self.qids: set[str] = set()
         self.errors = 0
-        self.refilling = False
         self.loading = False
         self.message = ""
         self.player: mpv.MPV | None = None
@@ -1724,35 +1735,43 @@ class YTRadio(App):
         tracks = [r for r in self.rows if r["kind"] == "track"]
         if self.view in ("playlist", "liked", "history"):
             idx = tracks.index(self.rows[i])
-            self.queue = tracks
-            self.qids = {t["id"] for t in tracks}
+            self.rq.reset(tracks)
             self.run_worker(self.play_at(idx), exclusive=True, group="play")
         else:  # busca / início: começa um rádio a partir da faixa escolhida
-            self.queue = [self.rows[i]]
-            self.qids = {self.rows[i]["id"]}
+            self.rq.reset([self.rows[i]])
             self.run_worker(self.play_at(0), exclusive=True, group="play")
             self.extend_radio()
 
-    def extend_radio(self):
-        if self.refilling or not self.queue:
-            return
-        self.refilling = True
-        self.run_worker(self._extend_radio(self.queue[-1]["id"]), exclusive=False, group="radio")
+    @property
+    def queue(self) -> list[dict]:
+        return self.rq.tracks
 
-    async def _extend_radio(self, seed: str):
+    @property
+    def qi(self) -> int:
+        return self.rq.qi
+
+    @qi.setter
+    def qi(self, v: int):
+        self.rq.qi = v
+
+    def extend_radio(self):
+        if not self.rq.refilling:
+            self.run_worker(self._extend_radio(), exclusive=False, group="radio", exit_on_error=False)
+
+    async def _extend_radio(self) -> bool:
+        gen = self.rq.generation
         try:
-            new = await self.io(self.api.radio, seed)
-            added = [t for t in new if t["id"] not in self.qids]
-            for t in added:
-                self.qids.add(t["id"])
-            self.queue.extend(added)
+            added = await self.rq.refill(lambda seed: self.io(self.api.radio, seed))
+        except Exception as e:
+            log.exception("falha ao abastecer o rádio")
+            if gen == self.rq.generation:
+                self.flash(f"Rádio: {e}")
+            return False
+        if added:
             if self.view == "queue":
                 self.fill(list(self.queue), "Fila / rádio", "queue")
             self.prefetch_next()
-        except Exception as e:
-            self.flash(f"Rádio: {e}")
-        finally:
-            self.refilling = False
+        return True
 
     def maybe_refill(self):
         if self.autoplay and len(self.queue) - self.qi - 1 <= 4:
@@ -1821,12 +1840,10 @@ class YTRadio(App):
 
     async def go_next(self):
         if self.qi + 1 >= len(self.queue) and self.autoplay:
-            self.refilling = False
-            self.extend_radio()
-            for _ in range(60):  # espera o rádio responder (até ~15s)
-                await asyncio.sleep(0.25)
-                if self.qi + 1 < len(self.queue):
-                    break
+            try:
+                await asyncio.wait_for(self._extend_radio(), 15)  # aguarda a busca em andamento (ou inicia uma)
+            except asyncio.TimeoutError:
+                self.flash("Rádio: tempo esgotado")
         if self.qi + 1 < len(self.queue):
             await self.play_at(self.qi + 1)
         else:
@@ -1885,7 +1902,7 @@ class YTRadio(App):
     def radio_from(self, r: dict):
         if r["kind"] != "track":
             return
-        self.queue, self.qids = [r], {r["id"]}
+        self.rq.reset([r])
         self.autoplay = True
         self.run_worker(self.play_at(0), exclusive=True, group="play")
         self.extend_radio()
@@ -2203,6 +2220,11 @@ class YTRadio(App):
         self.query_one("#chips", ClickText).set(cs)
 
 def main():
+    os.makedirs(config_dir(), exist_ok=True)
+    logging.basicConfig(
+        filename=os.path.join(config_dir(), "ytradio.log"), level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     YTRadio().run()
 
 
