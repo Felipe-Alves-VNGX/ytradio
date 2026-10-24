@@ -82,6 +82,7 @@ except Exception:  # biblioteca ausente: só blocos de texto
     GfxImage, GRAPHICS = None, False
 from yt_dlp.cookies import extract_cookies_from_browser  # noqa: E402
 from ytmusicapi import YTMusic  # noqa: E402
+from apicall import run_with_retries  # noqa: E402
 from radio import RadioQueue  # noqa: E402
 
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0"
@@ -214,13 +215,6 @@ def open_login_browser() -> str:
     return "padrão"
 
 
-AUTH_ERROR_HINTS = ("401", "403", "unauthorized", "forbidden", "logged out", "sign in", "authentication", "login")
-
-
-def looks_like_auth_error(e: Exception) -> bool:
-    return any(h in str(e).lower() for h in AUTH_ERROR_HINTS)
-
-
 def load_cookie_jar():
     """Cookies de login: arquivo cookies.txt (YTRADIO_COOKIES) ou lidos AO VIVO do navegador."""
     if COOKIES_FILE:
@@ -312,7 +306,10 @@ def load_state() -> dict:
     try:
         with open(STATE_FILE) as f:
             return json.load(f)
+    except FileNotFoundError:
+        return {}
     except Exception:
+        log.exception("estado ilegível em %s; começando do zero", STATE_FILE)
         return {}
 
 
@@ -359,19 +356,20 @@ class Api:
         self.yt = YTMusic(json.dumps(auth))
 
     def call(self, name: str, *a, **k):
-        with self.lock:
-            if self.yt is None:
-                self.connect()
-            try:
+        def attempt():
+            with self.lock:
+                if self.yt is None:
+                    self.connect()
                 return getattr(self.yt, name)(*a, **k)
-            except Exception:
-                self.connect()  # cookies podem ter rotacionado: relê do Zen e tenta de novo
-                try:
-                    return getattr(self.yt, name)(*a, **k)
-                except Exception as e:
-                    if looks_like_auth_error(e):
-                        raise CookieError(cookie_help("a sessão do YouTube expirou")) from e
-                    raise
+
+        def reconnect():
+            with self.lock:
+                self.connect()
+
+        return run_with_retries(
+            name, attempt, reconnect, lambda e: CookieError(cookie_help("a sessão do YouTube expirou")),
+            passthrough=(CookieError,),
+        )
 
     def logged_in(self) -> bool:
         """Relê os cookies do navegador e confirma que o YouTube Music aceita o login."""
@@ -381,6 +379,7 @@ class Api:
                 self.yt.get_account_info()
             return True
         except Exception:
+            log.exception("verificação de login falhou")
             return False
 
     def tracks(self, raw) -> list[dict]:
@@ -646,7 +645,7 @@ class Mpris:
             try:
                 self.player.emit_properties_changed(props)
             except Exception:
-                pass
+                log.debug("MPRIS: falha ao emitir propriedades", exc_info=True)
 
 
 class NullMedia:
@@ -714,7 +713,7 @@ class WinMedia:
                 du.thumbnail = RandomAccessStreamReference.create_from_uri(Uri(c["art"]))
                 du.update()
         except Exception:
-            pass
+            log.debug("SMTC: falha ao atualizar a mídia", exc_info=True)
 
 
 # ----------------------------------------------------------------------------- visual
@@ -1796,6 +1795,7 @@ class YTRadio(App):
             try:
                 data = await self.io(fetch_cover, url)
             except Exception:
+                log.warning("falha ao baixar a capa", exc_info=True)
                 self.cover_data = None
                 self.update_cover()
                 return
