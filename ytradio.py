@@ -11,6 +11,7 @@ import glob
 import io
 import json
 import locale
+import logging
 import os
 import random
 import re
@@ -81,9 +82,14 @@ except Exception:  # biblioteca ausente: só blocos de texto
     GfxImage, GRAPHICS = None, False
 from yt_dlp.cookies import extract_cookies_from_browser  # noqa: E402
 from ytmusicapi import YTMusic  # noqa: E402
+from apicall import run_with_retries  # noqa: E402
+from models import Row, Track, norm  # noqa: E402
+from radio import RadioQueue  # noqa: E402
+from state import load_state, save_state  # noqa: E402
 
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0"
 STATE_FILE = os.path.join(config_dir(), "state.json")
+log = logging.getLogger("ytradio")
 CONFIG_FILE = os.path.join(config_dir(), "config.json")
 
 
@@ -211,13 +217,6 @@ def open_login_browser() -> str:
     return "padrão"
 
 
-AUTH_ERROR_HINTS = ("401", "403", "unauthorized", "forbidden", "logged out", "sign in", "authentication", "login")
-
-
-def looks_like_auth_error(e: Exception) -> bool:
-    return any(h in str(e).lower() for h in AUTH_ERROR_HINTS)
-
-
 def load_cookie_jar():
     """Cookies de login: arquivo cookies.txt (YTRADIO_COOKIES) ou lidos AO VIVO do navegador."""
     if COOKIES_FILE:
@@ -266,62 +265,6 @@ def fmt_time(s) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
-def parse_len(txt) -> int:
-    if not txt or not isinstance(txt, str):
-        return 0
-    try:
-        parts = [int(p) for p in txt.split(":")]
-    except ValueError:
-        return 0
-    secs = 0
-    for p in parts:
-        secs = secs * 60 + p
-    return secs
-
-
-def big_art(url: str) -> str:
-    return re.sub(r"=w\d+-h\d+[^/]*$", "=w544-h544-l90-rj", url) if "googleusercontent" in url else url
-
-
-def norm(t: dict) -> dict | None:
-    """Normaliza faixas de busca/playlist/rádio num formato único."""
-    vid = t.get("videoId")
-    if not vid or t.get("isAvailable") is False:
-        return None
-    artists = t.get("artists") or ([{"name": t["author"]}] if t.get("author") else [])
-    album = t.get("album")
-    album = album.get("name") if isinstance(album, dict) else (album or "")
-    thumbs = t.get("thumbnail") or t.get("thumbnails") or []
-    art = max(thumbs, key=lambda x: x.get("width", 0))["url"] if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
-    secs = t.get("duration_seconds") or parse_len(t.get("length") or t.get("duration"))
-    return {
-        "kind": "track",
-        "id": vid,
-        "title": t.get("title") or "?",
-        "artist": ", ".join(a["name"] for a in artists if a.get("name")),
-        "album": album or "",
-        "dur": secs,
-        "art": big_art(art),
-    }
-
-
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_state(d: dict) -> None:
-    try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        with open(STATE_FILE, "w") as f:
-            json.dump(d, f)
-    except Exception:
-        pass
-
-
 # ----------------------------------------------------------------------------- YouTube Music API
 class Api:
     """ytmusicapi autenticado com os cookies atuais do Zen."""
@@ -345,19 +288,20 @@ class Api:
         self.yt = YTMusic(json.dumps(auth))
 
     def call(self, name: str, *a, **k):
-        with self.lock:
-            if self.yt is None:
-                self.connect()
-            try:
+        def attempt():
+            with self.lock:
+                if self.yt is None:
+                    self.connect()
                 return getattr(self.yt, name)(*a, **k)
-            except Exception:
-                self.connect()  # cookies podem ter rotacionado: relê do Zen e tenta de novo
-                try:
-                    return getattr(self.yt, name)(*a, **k)
-                except Exception as e:
-                    if looks_like_auth_error(e):
-                        raise CookieError(cookie_help("a sessão do YouTube expirou")) from e
-                    raise
+
+        def reconnect():
+            with self.lock:
+                self.connect()
+
+        return run_with_retries(
+            name, attempt, reconnect, lambda e: CookieError(cookie_help("a sessão do YouTube expirou")),
+            passthrough=(CookieError,),
+        )
 
     def logged_in(self) -> bool:
         """Relê os cookies do navegador e confirma que o YouTube Music aceita o login."""
@@ -367,17 +311,18 @@ class Api:
                 self.yt.get_account_info()
             return True
         except Exception:
+            log.exception("verificação de login falhou")
             return False
 
-    def tracks(self, raw) -> list[dict]:
+    def tracks(self, raw) -> list[Track]:
         return [t for t in (norm(x) for x in raw or []) if t]
 
-    def search(self, q: str) -> list[dict]:
+    def search(self, q: str) -> list[Track]:
         rows = self.tracks(self.call("search", q, filter="songs"))
         return rows or self.tracks(self.call("search", q, filter="videos"))
 
-    def home(self) -> list[dict]:
-        rows = []
+    def home(self) -> list[Row]:
+        rows: list[Row] = []
         for shelf in self.call("get_home", limit=6):
             for it in shelf.get("contents", []):
                 if it.get("videoId"):
@@ -393,19 +338,19 @@ class Api:
                     })
         return rows
 
-    def liked(self) -> list[dict]:
+    def liked(self) -> list[Track]:
         return self.tracks(self.call("get_liked_songs", limit=500)["tracks"])
 
-    def history(self) -> list[dict]:
+    def history(self) -> list[Track]:
         return self.tracks(self.call("get_history"))
 
     def playlists(self) -> list[dict]:
         return [p for p in self.call("get_library_playlists", limit=100) if p.get("playlistId")]
 
-    def playlist(self, pid: str) -> list[dict]:
+    def playlist(self, pid: str) -> list[Track]:
         return self.tracks(self.call("get_playlist", pid, limit=500)["tracks"])
 
-    def album(self, bid: str) -> list[dict]:
+    def album(self, bid: str) -> list[Track]:
         data = self.call("get_album", bid)
         rows = self.tracks(data["tracks"])
         for r in rows:
@@ -414,7 +359,7 @@ class Api:
                 continue
         return rows
 
-    def radio(self, vid: str) -> list[dict]:
+    def radio(self, vid: str) -> list[Track]:
         return self.tracks(self.call("get_watch_playlist", videoId=vid, radio=True, limit=50)["tracks"])
 
     def like(self, vid: str):
@@ -632,7 +577,7 @@ class Mpris:
             try:
                 self.player.emit_properties_changed(props)
             except Exception:
-                pass
+                log.debug("MPRIS: falha ao emitir propriedades", exc_info=True)
 
 
 class NullMedia:
@@ -700,7 +645,7 @@ class WinMedia:
                 du.thumbnail = RandomAccessStreamReference.create_from_uri(Uri(c["art"]))
                 du.update()
         except Exception:
-            pass
+            log.debug("SMTC: falha ao atualizar a mídia", exc_info=True)
 
 
 # ----------------------------------------------------------------------------- visual
@@ -1291,7 +1236,7 @@ class YTRadio(App):
     ]
 
     def __init__(self):
-        st = load_state()
+        st = load_state(STATE_FILE)
         self.theme_id: str = st.get("theme", "album")
         self.cover_mode: str = st.get("cover", "auto")
         self.album_rgb = None
@@ -1303,15 +1248,12 @@ class YTRadio(App):
         self.volume: float = st.get("volume", 80)
         self.loop: bool = st.get("loop", False)
         self.autoplay: bool = st.get("autoplay", True)
-        self.queue: list[dict] = []
-        self.qi = -1
-        self.current: dict | None = None
-        self.rows: list[dict] = []
+        self.rq = RadioQueue()
+        self.current: Track | None = None
+        self.rows: list[Row] = []
         self.view = "search"
         self.view_title = ""
-        self.qids: set[str] = set()
         self.errors = 0
-        self.refilling = False
         self.loading = False
         self.message = ""
         self.player: mpv.MPV | None = None
@@ -1327,7 +1269,7 @@ class YTRadio(App):
         self._scheme_mtime = None
         self.sort: tuple[str, bool] | None = None
         self._view_key = None
-        self.rows_src: list[dict] = []
+        self.rows_src: list[Row] = []
         self._drag_row: int | None = None
         self._premute = 0.0
         self.side_w: int = int(st.get("side_w", 32))
@@ -1394,7 +1336,7 @@ class YTRadio(App):
             self.flash(f"MPRIS indisponível: {e}")
 
     def persist(self):
-        save_state({"volume": self.volume, "loop": self.loop, "autoplay": self.autoplay,
+        save_state(STATE_FILE, {"volume": self.volume, "loop": self.loop, "autoplay": self.autoplay,
                     "theme": self.theme_id, "cover": self.cover_mode, "side_w": self.side_w})
 
     def on_unmount(self):
@@ -1546,7 +1488,7 @@ class YTRadio(App):
         self.flash("Capa: " + dict(COVER_MODES)[self.cover_mode])
 
     # ---- tabela
-    def row_cells(self, r: dict, playing: bool) -> list:
+    def row_cells(self, r: Row, playing: bool) -> list:
         hi = self.palette["art-hi"]
         if r["kind"] != "track":
             mark = Text("☰" if r["kind"] == "playlist" else "◉", style="dim")
@@ -1563,7 +1505,7 @@ class YTRadio(App):
     def eq_frame(self) -> str:
         return " ‖ " if self.is_paused() else EQ_FRAMES[self.eq % len(EQ_FRAMES)]
 
-    def sorted_rows(self, rows: list[dict]) -> list[dict]:
+    def sorted_rows(self, rows: list[Row]) -> list[Row]:
         if not self.sort or self.view == "queue":
             return list(rows)
         k, rev = self.sort
@@ -1573,7 +1515,7 @@ class YTRadio(App):
         """Redesenha a tabela com as linhas atuais (mantém a ordenação escolhida)."""
         self.fill(self.rows_src, self.view_title, self.view)
 
-    def fill(self, rows: list[dict], title: str, view: str):
+    def fill(self, rows: list[Row], title: str, view: str):
         vk = (view, title)
         if vk != self._view_key:  # outra lista: zera a ordenação
             self._view_key, self.sort = vk, None
@@ -1724,35 +1666,43 @@ class YTRadio(App):
         tracks = [r for r in self.rows if r["kind"] == "track"]
         if self.view in ("playlist", "liked", "history"):
             idx = tracks.index(self.rows[i])
-            self.queue = tracks
-            self.qids = {t["id"] for t in tracks}
+            self.rq.reset(tracks)
             self.run_worker(self.play_at(idx), exclusive=True, group="play")
         else:  # busca / início: começa um rádio a partir da faixa escolhida
-            self.queue = [self.rows[i]]
-            self.qids = {self.rows[i]["id"]}
+            self.rq.reset([self.rows[i]])
             self.run_worker(self.play_at(0), exclusive=True, group="play")
             self.extend_radio()
 
-    def extend_radio(self):
-        if self.refilling or not self.queue:
-            return
-        self.refilling = True
-        self.run_worker(self._extend_radio(self.queue[-1]["id"]), exclusive=False, group="radio")
+    @property
+    def queue(self) -> list[Track]:
+        return self.rq.tracks
 
-    async def _extend_radio(self, seed: str):
+    @property
+    def qi(self) -> int:
+        return self.rq.qi
+
+    @qi.setter
+    def qi(self, v: int):
+        self.rq.qi = v
+
+    def extend_radio(self):
+        if not self.rq.refilling:
+            self.run_worker(self._extend_radio(), exclusive=False, group="radio", exit_on_error=False)
+
+    async def _extend_radio(self) -> bool:
+        gen, rev = self.rq.generation, self.rq.revision
         try:
-            new = await self.io(self.api.radio, seed)
-            added = [t for t in new if t["id"] not in self.qids]
-            for t in added:
-                self.qids.add(t["id"])
-            self.queue.extend(added)
+            await self.rq.refill(lambda seed: self.io(self.api.radio, seed))
+        except Exception as e:
+            log.exception("falha ao abastecer o rádio")
+            if gen == self.rq.generation:
+                self.flash(f"Rádio: {e}")
+            return False
+        if gen == self.rq.generation and rev != self.rq.revision:  # adicionou ou cortou faixas
             if self.view == "queue":
                 self.fill(list(self.queue), "Fila / rádio", "queue")
             self.prefetch_next()
-        except Exception as e:
-            self.flash(f"Rádio: {e}")
-        finally:
-            self.refilling = False
+        return True
 
     def maybe_refill(self):
         if self.autoplay and len(self.queue) - self.qi - 1 <= 4:
@@ -1770,13 +1720,14 @@ class YTRadio(App):
             self.run_worker(self.load_cover(self.current), exclusive=True, group="cover", exit_on_error=False)
         self.render_all()
 
-    async def load_cover(self, track: dict):
+    async def load_cover(self, track: Track):
         url = track["art"]
         data = self.covers.get(url)
         if data is None:
             try:
                 data = await self.io(fetch_cover, url)
             except Exception:
+                log.warning("falha ao baixar a capa", exc_info=True)
                 self.cover_data = None
                 self.update_cover()
                 return
@@ -1821,12 +1772,10 @@ class YTRadio(App):
 
     async def go_next(self):
         if self.qi + 1 >= len(self.queue) and self.autoplay:
-            self.refilling = False
-            self.extend_radio()
-            for _ in range(60):  # espera o rádio responder (até ~15s)
-                await asyncio.sleep(0.25)
-                if self.qi + 1 < len(self.queue):
-                    break
+            try:
+                await asyncio.wait_for(self._extend_radio(), 15)  # aguarda a busca em andamento (ou inicia uma)
+            except asyncio.TimeoutError:
+                self.flash("Rádio: tempo esgotado")
         if self.qi + 1 < len(self.queue):
             await self.play_at(self.qi + 1)
         else:
@@ -1882,10 +1831,10 @@ class YTRadio(App):
             return
         self.radio_from(self.rows[t.cursor_row])
 
-    def radio_from(self, r: dict):
+    def radio_from(self, r: Row):
         if r["kind"] != "track":
             return
-        self.queue, self.qids = [r], {r["id"]}
+        self.rq.reset([r])
         self.autoplay = True
         self.run_worker(self.play_at(0), exclusive=True, group="play")
         self.extend_radio()
@@ -2203,6 +2152,11 @@ class YTRadio(App):
         self.query_one("#chips", ClickText).set(cs)
 
 def main():
+    os.makedirs(config_dir(), exist_ok=True)
+    logging.basicConfig(
+        filename=os.path.join(config_dir(), "ytradio.log"), level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     YTRadio().run()
 
 
