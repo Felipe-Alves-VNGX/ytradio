@@ -16,6 +16,7 @@ import random
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -59,6 +60,11 @@ from dbus_fast import BusType, Variant  # noqa: E402
 from dbus_fast.aio import MessageBus  # noqa: E402
 from dbus_fast.service import PropertyAccess, ServiceInterface, dbus_property, method  # noqa: E402
 from PIL import Image  # noqa: E402
+
+try:  # visualizador de espectro (opcional)
+    import numpy as np  # noqa: E402
+except ImportError:
+    np = None
 from rich.style import Style  # noqa: E402
 from rich.text import Text  # noqa: E402
 from textual import events, on  # noqa: E402
@@ -998,6 +1004,7 @@ Screen { layout: vertical; background: transparent; }
 #chips { margin-left: 2; }
 #vollabel { margin-left: 3; }
 #vol { width: 18; height: 1; margin: 0 1; }
+#viz { height: 6; margin: 0 0 0 0; padding: 0 1; }
 #hints { height: 1; content-align: center middle; }
 """
 
@@ -1013,7 +1020,7 @@ NAV = [
 HINTS = [("space", "pausa", "toggle_pause"), ("n", "próxima", "next"), ("p", "anterior", "prev"),
          ("l", "loop", "toggle_loop"), ("a", "rádio", "toggle_autoplay"), ("r", "rádio daqui", "radio_here"),
          ("y", "curtir", "like"), ("s", "embaralhar", "shuffle"), ("t", "tema", "pick_theme"),
-         ("c", "capa", "cycle_cover"), ("/", "buscar", "focus_search"), ("q", "sair", "quit")]
+         ("c", "capa", "cycle_cover"), ("v", "visualizador", "toggle_viz"), ("/", "buscar", "focus_search"), ("q", "sair", "quit")]
 
 SORT_KEYS = {
     "t": lambda r: (r.get("title") or "").lower(),
@@ -1180,6 +1187,138 @@ class Splitter(Widget):
             self.app.set_side_width(ev.screen_x, final=True)
 
 
+class Spectrum:
+    """Captura o áudio que sai nas caixas (monitor da saída padrão, via parec/pw-record) e calcula o espectro por FFT."""
+
+    RATE = 44100
+    WIN = 2048
+    CMDS = [
+        ["parec", "-d", "@DEFAULT_MONITOR@", f"--rate={RATE}", "--format=s16le", "--channels=1", "--latency-msec=20"],
+        ["pw-record", "-P", "stream.capture.sink=true", "--rate", str(RATE), "--channels", "1", "--format", "s16", "-"],
+    ]
+
+    def __init__(self):
+        self.proc: subprocess.Popen | None = None
+        self.buf = None if np is None else np.zeros(self.WIN, dtype=np.float32)
+        self.win = None if np is None else np.hanning(self.WIN).astype(np.float32)
+        self.freqs = None if np is None else np.fft.rfftfreq(self.WIN, 1 / self.RATE)
+        self.peak = 1e-3
+
+    @staticmethod
+    def supported() -> bool:
+        return IS_LINUX and np is not None and any(shutil.which(c[0]) for c in Spectrum.CMDS)
+
+    def start(self) -> bool:
+        if self.proc is not None and self.proc.poll() is None:
+            return True
+        for cmd in self.CMDS:
+            if not shutil.which(cmd[0]):
+                continue
+            try:
+                self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+            except OSError:
+                continue
+            threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
+            return True
+        return False
+
+    def stop(self):
+        p, self.proc = self.proc, None
+        if p is not None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+
+    def _read(self, proc):
+        n = 1024  # amostras por leitura (~23 ms)
+        try:
+            while proc.poll() is None:
+                raw = proc.stdout.read(n * 2)
+                if not raw or len(raw) < n * 2:
+                    break
+                x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                self.buf = np.concatenate((self.buf[n:], x))
+        except Exception:
+            pass
+
+    def bars(self, n: int):
+        """n barras (0..1) em escala logarítmica de frequência, com ganho automático."""
+        mag = np.abs(np.fft.rfft(self.buf * self.win)) / (self.WIN / 4)
+        edges = np.geomspace(60, 16000, n + 1)
+        idx = np.searchsorted(self.freqs, edges)
+        out = np.empty(n, dtype=np.float32)
+        for i in range(n):
+            lo, hi = idx[i], max(idx[i + 1], idx[i] + 1)
+            out[i] = mag[lo:hi].max() if hi - lo > 1 else np.interp(np.sqrt(edges[i] * edges[i + 1]), self.freqs, mag)
+        out *= (np.sqrt(edges[:-1] * edges[1:]) / 1000.0) ** 0.35 * 1.4  # compensa a queda de energia nos agudos
+        self.peak = max(self.peak * 0.995, float(out.max()), 0.02)
+        return np.clip(out / self.peak, 0.0, 1.0) ** 0.8
+
+
+class Visualizer(Widget):
+    """Barras de espectro em tempo real (estilo cava), nas cores do tema."""
+
+    BLOCKS = " ▁▂▃▄▅▆▇█"
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.spec = Spectrum()
+        self.heights = None
+        self.running = False
+
+    def set_running(self, on: bool) -> bool:
+        if on and not self.running:
+            self.running = self.spec.start()
+            if self.running:
+                self.timer = self.set_interval(1 / 30, self.step)
+        elif not on and self.running:
+            self.running = False
+            self.timer.stop()
+            self.spec.stop()
+            self.heights = None
+        return self.running
+
+    def on_unmount(self):
+        self.spec.stop()
+
+    def layout(self) -> tuple[int, int]:
+        bw = 2 if self.size.width >= 48 else 1
+        return bw, max(1, (self.size.width + 1) // (bw + 1))
+
+    def step(self):
+        _, n = self.layout()
+        v = self.spec.bars(n)
+        h = self.heights
+        if h is None or len(h) != n:
+            h = np.zeros(n, dtype=np.float32)
+        self.heights = np.maximum(v, h * 0.86)  # sobe na hora, cai suave
+        self.refresh()
+
+    def render(self) -> Text:
+        pal = self.app.palette
+        rows = max(1, self.size.height)
+        bw, n = self.layout()
+        hs = self.heights if self.heights is not None and len(self.heights) == n else [0.0] * n
+        pad = " " * max(0, (self.size.width - (n * (bw + 1) - 1)) // 2)
+        lo, hi = (None, None) if pal.get("ansi") else (hex_to_rgb(pal["art-dim"]), hex_to_rgb(pal["art-hi"]))
+        out = Text(no_wrap=True)
+        for t in range(rows):
+            level = rows - 1 - t
+            line = pad
+            for hv in hs:
+                f = int(max(0, min(8, round(float(hv) * rows * 8) - level * 8)))
+                line += self.BLOCKS[f] * bw + " "
+            if lo is None:
+                style = Style(color=pal["art-hi"] if level >= rows / 2 else pal["art"])
+            else:
+                style = Style(color=hexc(lerp(lo, hi, level / max(1, rows - 1))))
+            out.append(line, style=style)
+            if t < rows - 1:
+                out.append("\n")
+        return out
+
+
 class TrackTable(DataTable):
     """Tabela de faixas: repassa botão direito (rádio) e arrastar-e-soltar (reordenar a fila) ao app."""
 
@@ -1282,6 +1421,7 @@ class YTRadio(App):
         Binding("y", "like", "Curtir"),
         Binding("t", "pick_theme", "Tema"),
         Binding("c", "cycle_cover", "Capa"),
+        Binding("v", "toggle_viz", "Visualizador"),
         Binding("slash", "focus_search", "Buscar"),
         Binding("bracketleft", "seek_back", "-10s", show=False),
         Binding("bracketright", "seek_fwd", "+10s", show=False),
@@ -1331,6 +1471,7 @@ class YTRadio(App):
         self._drag_row: int | None = None
         self._premute = 0.0
         self.side_w: int = int(st.get("side_w", 32))
+        self.viz_on: bool = st.get("viz", True) and Spectrum.supported()
 
     def get_css_variables(self) -> dict[str, str]:
         v = super().get_css_variables()
@@ -1353,6 +1494,7 @@ class YTRadio(App):
                 yield Input(placeholder=f"{IC['search']}  Buscar músicas, artistas…", id="q")
                 yield Static(id="viewtitle")
                 yield TrackTable(id="tbl", cursor_type="row", zebra_stripes=False)
+                yield Visualizer(id="viz")
                 with Vertical(id="card"):
                     yield Static(id="meta")
                     with Horizontal(id="seekrow"):
@@ -1395,7 +1537,7 @@ class YTRadio(App):
 
     def persist(self):
         save_state({"volume": self.volume, "loop": self.loop, "autoplay": self.autoplay,
-                    "theme": self.theme_id, "cover": self.cover_mode, "side_w": self.side_w})
+                    "theme": self.theme_id, "cover": self.cover_mode, "side_w": self.side_w, "viz": self.viz_on})
 
     def on_unmount(self):
         self.persist()
@@ -1422,6 +1564,10 @@ class YTRadio(App):
         self.query_one("#meta").styles.height = 1 if compact else 3
         self.query_one("#ctrlrow").styles.margin = (0, 0, 0, 0) if compact else (1, 0, 0, 0)
         self.query_one("#side").styles.width = self.side_w
+        viz = self.query_one("#viz", Visualizer)
+        viz.styles.height = 3 if compact else 6
+        viz.display = self.viz_on
+        viz.set_running(self.viz_on)
         self.show_album = self.size.width >= 118
         self.update_cover()
 
@@ -1536,6 +1682,15 @@ class YTRadio(App):
 
     def action_pick_theme(self):
         self.push_screen(ThemePicker(theme_items(self.album_rgb), self.theme_id), self.set_theme)
+
+    def action_toggle_viz(self):
+        if not Spectrum.supported():
+            self.flash("Visualizador indisponível (precisa de numpy e parec/pw-record no Linux)")
+            return
+        self.viz_on = not self.viz_on
+        self.persist()
+        self.apply_layout()
+        self.flash("Visualizador: " + ("ligado" if self.viz_on else "desligado"))
 
     def action_cycle_cover(self):
         ids = [m for m, _ in COVER_MODES]

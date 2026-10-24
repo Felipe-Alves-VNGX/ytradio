@@ -16,6 +16,7 @@ Desenvolvido e testado no Linux (Fedora/Bazzite + Hyprland + kitty).
 - **Capa em imagem real** no kitty (verificado) e em terminais com sixel (não testado); em blocos de texto nos demais.
 - **Temas**: segue as cores da capa, as cores ANSI do seu terminal (acompanha a paleta do terminal), 12 presets e o esquema do [Caelestia](https://github.com/caelestia-dots/shell)/matugen. Tecla `t`.
 - **Mouse completo**: barras de busca e volume arrastáveis, botões clicáveis, ordenar clicando no cabeçalho, arrastar para reordenar a fila, divisória redimensionável, botão direito para iniciar um rádio.
+- **Visualizador de espectro** (estilo [cava](https://github.com/karlstav/cava)) nas cores do tema. Tecla `v` liga/desliga. Linux: captura a saída de áudio do sistema via `parec`/`pw-record` (PulseAudio/PipeWire) e usa `numpy`; sem eles, fica desativado.
 - **Controles de mídia do sistema**: MPRIS no Linux (teclas de mídia, `playerctl`, widgets do desktop) e SMTC no Windows (experimental).
 - Próxima faixa já resolvida em segundo plano: pular é quase instantâneo.
 
@@ -105,7 +106,8 @@ Variáveis de ambiente ou o arquivo `config.json` (Linux: `~/.config/ytradio/`, 
 | `l` | loop da faixa | | `[` `]` | −10 s / +10 s |
 | `a` | rádio automático liga/desliga | | `+` `-` | volume |
 | `r` | rádio a partir da faixa selecionada | | `y` | curtir |
-| `s` | embaralhar a fila | | `q` | sair |
+| `s` | embaralhar a fila | | `v` | visualizador de espectro |
+| `q` | sair | | | |
 
 **Mouse**: clique nos botões, chips e atalhos; arraste a barra de progresso e o volume; roda sobre as barras; 1º clique seleciona e 2º toca;
 clique no cabeçalho ordena; na **Fila** arraste uma linha para reordenar; arraste a divisória para alargar a barra lateral;

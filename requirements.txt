@@ -6,6 +6,7 @@ yt-dlp
 python-mpv>=1.0.8
 requests
 pillow>=10.3
+numpy>=1.26
 dbus-fast>=2.0
 
 # Controles de mídia do Windows (SMTC) — opcional e experimental
