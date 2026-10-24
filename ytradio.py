@@ -83,7 +83,9 @@ except Exception:  # biblioteca ausente: só blocos de texto
 from yt_dlp.cookies import extract_cookies_from_browser  # noqa: E402
 from ytmusicapi import YTMusic  # noqa: E402
 from apicall import run_with_retries  # noqa: E402
+from models import Row, Track, norm  # noqa: E402
 from radio import RadioQueue  # noqa: E402
+from state import load_state, save_state  # noqa: E402
 
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0"
 STATE_FILE = os.path.join(config_dir(), "state.json")
@@ -263,76 +265,6 @@ def fmt_time(s) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
-def parse_len(txt) -> int:
-    if not txt or not isinstance(txt, str):
-        return 0
-    try:
-        parts = [int(p) for p in txt.split(":")]
-    except ValueError:
-        return 0
-    secs = 0
-    for p in parts:
-        secs = secs * 60 + p
-    return secs
-
-
-def big_art(url: str) -> str:
-    return re.sub(r"=w\d+-h\d+[^/]*$", "=w544-h544-l90-rj", url) if "googleusercontent" in url else url
-
-
-def norm(t: dict) -> dict | None:
-    """Normaliza faixas de busca/playlist/rádio num formato único."""
-    vid = t.get("videoId")
-    if not vid or t.get("isAvailable") is False:
-        return None
-    artists = t.get("artists") or ([{"name": t["author"]}] if t.get("author") else [])
-    album = t.get("album")
-    album = album.get("name") if isinstance(album, dict) else (album or "")
-    thumbs = t.get("thumbnail") or t.get("thumbnails") or []
-    art = max(thumbs, key=lambda x: x.get("width", 0))["url"] if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
-    secs = t.get("duration_seconds") or parse_len(t.get("length") or t.get("duration"))
-    return {
-        "kind": "track",
-        "id": vid,
-        "title": t.get("title") or "?",
-        "artist": ", ".join(a["name"] for a in artists if a.get("name")),
-        "album": album or "",
-        "dur": secs,
-        "art": big_art(art),
-    }
-
-
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        log.exception("estado ilegível em %s; começando do zero", STATE_FILE)
-        return {}
-
-
-def save_state(d: dict) -> None:
-    """Grava em arquivo temporário na mesma pasta e troca de uma vez, para não corromper o estado."""
-    tmp = None
-    try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE_FILE), prefix="state.", suffix=".tmp")
-        with os.fdopen(fd, "w") as f:
-            json.dump(d, f)
-        os.replace(tmp, STATE_FILE)
-        tmp = None
-    except Exception:
-        log.exception("não foi possível salvar %s", STATE_FILE)
-    finally:
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-
-
 # ----------------------------------------------------------------------------- YouTube Music API
 class Api:
     """ytmusicapi autenticado com os cookies atuais do Zen."""
@@ -382,15 +314,15 @@ class Api:
             log.exception("verificação de login falhou")
             return False
 
-    def tracks(self, raw) -> list[dict]:
+    def tracks(self, raw) -> list[Track]:
         return [t for t in (norm(x) for x in raw or []) if t]
 
-    def search(self, q: str) -> list[dict]:
+    def search(self, q: str) -> list[Track]:
         rows = self.tracks(self.call("search", q, filter="songs"))
         return rows or self.tracks(self.call("search", q, filter="videos"))
 
-    def home(self) -> list[dict]:
-        rows = []
+    def home(self) -> list[Row]:
+        rows: list[Row] = []
         for shelf in self.call("get_home", limit=6):
             for it in shelf.get("contents", []):
                 if it.get("videoId"):
@@ -406,19 +338,19 @@ class Api:
                     })
         return rows
 
-    def liked(self) -> list[dict]:
+    def liked(self) -> list[Track]:
         return self.tracks(self.call("get_liked_songs", limit=500)["tracks"])
 
-    def history(self) -> list[dict]:
+    def history(self) -> list[Track]:
         return self.tracks(self.call("get_history"))
 
     def playlists(self) -> list[dict]:
         return [p for p in self.call("get_library_playlists", limit=100) if p.get("playlistId")]
 
-    def playlist(self, pid: str) -> list[dict]:
+    def playlist(self, pid: str) -> list[Track]:
         return self.tracks(self.call("get_playlist", pid, limit=500)["tracks"])
 
-    def album(self, bid: str) -> list[dict]:
+    def album(self, bid: str) -> list[Track]:
         data = self.call("get_album", bid)
         rows = self.tracks(data["tracks"])
         for r in rows:
@@ -427,7 +359,7 @@ class Api:
                 continue
         return rows
 
-    def radio(self, vid: str) -> list[dict]:
+    def radio(self, vid: str) -> list[Track]:
         return self.tracks(self.call("get_watch_playlist", videoId=vid, radio=True, limit=50)["tracks"])
 
     def like(self, vid: str):
@@ -1304,7 +1236,7 @@ class YTRadio(App):
     ]
 
     def __init__(self):
-        st = load_state()
+        st = load_state(STATE_FILE)
         self.theme_id: str = st.get("theme", "album")
         self.cover_mode: str = st.get("cover", "auto")
         self.album_rgb = None
@@ -1317,8 +1249,8 @@ class YTRadio(App):
         self.loop: bool = st.get("loop", False)
         self.autoplay: bool = st.get("autoplay", True)
         self.rq = RadioQueue()
-        self.current: dict | None = None
-        self.rows: list[dict] = []
+        self.current: Track | None = None
+        self.rows: list[Row] = []
         self.view = "search"
         self.view_title = ""
         self.errors = 0
@@ -1337,7 +1269,7 @@ class YTRadio(App):
         self._scheme_mtime = None
         self.sort: tuple[str, bool] | None = None
         self._view_key = None
-        self.rows_src: list[dict] = []
+        self.rows_src: list[Row] = []
         self._drag_row: int | None = None
         self._premute = 0.0
         self.side_w: int = int(st.get("side_w", 32))
@@ -1404,7 +1336,7 @@ class YTRadio(App):
             self.flash(f"MPRIS indisponível: {e}")
 
     def persist(self):
-        save_state({"volume": self.volume, "loop": self.loop, "autoplay": self.autoplay,
+        save_state(STATE_FILE, {"volume": self.volume, "loop": self.loop, "autoplay": self.autoplay,
                     "theme": self.theme_id, "cover": self.cover_mode, "side_w": self.side_w})
 
     def on_unmount(self):
@@ -1556,7 +1488,7 @@ class YTRadio(App):
         self.flash("Capa: " + dict(COVER_MODES)[self.cover_mode])
 
     # ---- tabela
-    def row_cells(self, r: dict, playing: bool) -> list:
+    def row_cells(self, r: Row, playing: bool) -> list:
         hi = self.palette["art-hi"]
         if r["kind"] != "track":
             mark = Text("☰" if r["kind"] == "playlist" else "◉", style="dim")
@@ -1573,7 +1505,7 @@ class YTRadio(App):
     def eq_frame(self) -> str:
         return " ‖ " if self.is_paused() else EQ_FRAMES[self.eq % len(EQ_FRAMES)]
 
-    def sorted_rows(self, rows: list[dict]) -> list[dict]:
+    def sorted_rows(self, rows: list[Row]) -> list[Row]:
         if not self.sort or self.view == "queue":
             return list(rows)
         k, rev = self.sort
@@ -1583,7 +1515,7 @@ class YTRadio(App):
         """Redesenha a tabela com as linhas atuais (mantém a ordenação escolhida)."""
         self.fill(self.rows_src, self.view_title, self.view)
 
-    def fill(self, rows: list[dict], title: str, view: str):
+    def fill(self, rows: list[Row], title: str, view: str):
         vk = (view, title)
         if vk != self._view_key:  # outra lista: zera a ordenação
             self._view_key, self.sort = vk, None
@@ -1742,7 +1674,7 @@ class YTRadio(App):
             self.extend_radio()
 
     @property
-    def queue(self) -> list[dict]:
+    def queue(self) -> list[Track]:
         return self.rq.tracks
 
     @property
@@ -1788,7 +1720,7 @@ class YTRadio(App):
             self.run_worker(self.load_cover(self.current), exclusive=True, group="cover", exit_on_error=False)
         self.render_all()
 
-    async def load_cover(self, track: dict):
+    async def load_cover(self, track: Track):
         url = track["art"]
         data = self.covers.get(url)
         if data is None:
@@ -1899,7 +1831,7 @@ class YTRadio(App):
             return
         self.radio_from(self.rows[t.cursor_row])
 
-    def radio_from(self, r: dict):
+    def radio_from(self, r: Row):
         if r["kind"] != "track":
             return
         self.rq.reset([r])

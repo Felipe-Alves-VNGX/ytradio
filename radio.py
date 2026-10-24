@@ -2,9 +2,11 @@
 import asyncio
 from typing import Awaitable, Callable
 
+from models import Track
+
 MAX_HISTORY = 100  # faixas já tocadas mantidas antes da atual; as mais antigas saem (e podem voltar a tocar)
 
-Fetch = Callable[[str], Awaitable[list[dict]]]
+Fetch = Callable[[str], Awaitable[list[Track]]]
 
 
 class RadioQueue:
@@ -14,14 +16,14 @@ class RadioQueue:
     """
 
     def __init__(self, max_history: int = MAX_HISTORY):
-        self.tracks: list[dict] = []
+        self.tracks: list[Track] = []
         self.qi = -1
         self.ids: set[str] = set()
         self.generation = 0
         self.max_history = max_history
         self._task: asyncio.Task | None = None
 
-    def reset(self, tracks: list[dict], qi: int = -1) -> None:
+    def reset(self, tracks: list[Track], qi: int = -1) -> None:
         self.generation += 1
         self._task = None  # a busca antiga segue até o fim, mas seu resultado será ignorado
         self.tracks = list(tracks)
